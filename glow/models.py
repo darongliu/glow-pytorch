@@ -54,6 +54,7 @@ class FlowStep(nn.Module):
             self.f = f(in_channels // 2, in_channels, hidden_channels)
 
     def forward(self, input, logdet=None, reverse=False):
+        # forward: from image to z
         if not reverse:
             return self.normal_flow(input, logdet)
         else:
@@ -73,7 +74,7 @@ class FlowStep(nn.Module):
         elif self.flow_coupling == "affine":
             h = self.f(z1)
             shift, scale = thops.split_feature(h, "cross")
-            scale = torch.sigmoid(scale + 2.)
+            scale = torch.sigmoid(scale + 2.) # maybe to stabalize the init training(preserve more z1)
             z2 = z2 + shift
             z2 = z2 * scale
             logdet = thops.sum(torch.log(scale), dim=[1, 2, 3]) + logdet
@@ -108,13 +109,24 @@ class FlowNet(nn.Module):
                  flow_permutation="invconv",
                  flow_coupling="additive",
                  LU_decomposed=False):
-        """
+        '''
+        image_shape: H,W,C
+        '''
+        '''
                              K                                      K
         --> [Squeeze] -> [FlowStep] -> [Split] -> [Squeeze] -> [FlowStep]
                ^                           v
                |          (L - 1)          |
                + --------------------------+
-        """
+        '''
+        '''
+        this function only contain 
+                             K                                      
+        --> [Squeeze] -> [FlowStep] -> [Split]
+               ^                           v
+               |          (L - 1)          |
+               + --------------------------+
+        '''
         super().__init__()
         self.layers = nn.ModuleList()
         self.output_shapes = []
@@ -180,15 +192,15 @@ class Glow(nn.Module):
                             flow_coupling=hparams.Glow.flow_coupling,
                             LU_decomposed=hparams.Glow.LU_decomposed)
         self.hparams = hparams
-        self.y_classes = hparams.Glow.y_classes
+        self.y_classes = hparams.Glow.y_classes #class num
         # for prior
         if hparams.Glow.learn_top:
             C = self.flow.output_shapes[-1][1]
-            self.learn_top = modules.Conv2dZeros(C * 2, C * 2)
+            self.learn_top = modules.Conv2dZeros(C * 2, C * 2) # from original prior(normal gaussian) to a learned gaussian
         if hparams.Glow.y_condition:
             C = self.flow.output_shapes[-1][1]
             self.project_ycond = modules.LinearZeros(
-                hparams.Glow.y_classes, 2 * C)
+                hparams.Glow.y_classes, 2 * C) #2C means [mean, log(std)]
             self.project_class = modules.LinearZeros(
                 C, hparams.Glow.y_classes)
         # register prior hidden
@@ -233,12 +245,13 @@ class Glow(nn.Module):
         objective += modules.GaussianDiag.logp(mean, logs, z)
 
         if self.hparams.Glow.y_condition:
+            # shape of z: [-1, C, H, W]
             y_logits = self.project_class(z.mean(2).mean(2))
         else:
             y_logits = None
 
         # return
-        nll = (-objective) / float(np.log(2.) * pixels)
+        nll = (-objective) / float(np.log(2.) * pixels) # to minimize
         return z, nll, y_logits
 
     def reverse_flow(self, z, y_onehot, eps_std):

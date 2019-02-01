@@ -93,6 +93,10 @@ class ActNorm2d(_ActNorm):
 
 
 class LinearZeros(nn.Linear):
+    '''
+    init the linear layer as an identity mapping
+    an additional scale term is multiplicated before output, do not know why.
+    '''
     def __init__(self, in_channels, out_channels, logscale_factor=3):
         super().__init__(in_channels, out_channels)
         self.logscale_factor = logscale_factor
@@ -108,6 +112,9 @@ class LinearZeros(nn.Linear):
 
 
 class Conv2d(nn.Conv2d):
+    '''
+    an tf-like conv implementation
+    '''
     pad_dict = {
         "same": lambda kernel, stride: [((k - 1) * s + 1) // 2 for k, s in zip(kernel, stride)],
         "valid": lambda kernel, stride: [0 for _ in kernel]
@@ -118,9 +125,9 @@ class Conv2d(nn.Conv2d):
         # make paddding
         if isinstance(padding, str):
             if isinstance(kernel_size, int):
-                kernel_size = [kernel_size, kernel_size]
+                kernel_size = [kernel_size, kernel_size] # make kernel_size to be 2-element list if it is int
             if isinstance(stride, int):
-                stride = [stride, stride]
+                stride = [stride, stride] # make stride to be 2-element list if it is int
             padding = padding.lower()
             try:
                 padding = Conv2d.pad_dict[padding](kernel_size, stride)
@@ -150,6 +157,11 @@ class Conv2d(nn.Conv2d):
 
 
 class Conv2dZeros(nn.Conv2d):
+    '''
+    inherit from nn.conv2d not conv2d
+    no passing through actnorm
+    an additional scale term is multiplicated before output, do not know why.
+    '''
     def __init__(self, in_channels, out_channels,
                  kernel_size=[3, 3], stride=[1, 1],
                  padding="same", logscale_factor=3):
@@ -168,6 +180,9 @@ class Conv2dZeros(nn.Conv2d):
 
 
 class Permute2d(nn.Module):
+    '''
+    if shuffle==False, only reverse
+    '''
     def __init__(self, num_channels, shuffle):
         super().__init__()
         self.num_channels = num_channels
@@ -196,29 +211,34 @@ class InvertibleConv1x1(nn.Module):
         super().__init__()
         w_shape = [num_channels, num_channels]
         w_init = np.linalg.qr(np.random.randn(*w_shape))[0].astype(np.float32)
+        # qr decomposition: decompose an matrix to an orthonormal an upper triangular matrix
+        # in the init, w is an orthonormal, means we only kind of rotate the input
         if not LU_decomposed:
             # Sample a random orthogonal matrix:
             self.register_parameter("weight", nn.Parameter(torch.Tensor(w_init)))
         else:
-            np_p, np_l, np_u = scipy.linalg.lu(w_init)
+            np_p, np_l, np_u = scipy.linalg.lu(w_init) # p:permutation matrix, l:lower triangular matrix(with 1 on diagonal), u:upper triangular matrix 
             np_s = np.diag(np_u)
             np_sign_s = np.sign(np_s)
             np_log_s = np.log(np.abs(np_s))
-            np_u = np.triu(np_u, k=1)
-            l_mask = np.tril(np.ones(w_shape, dtype=np.float32), -1)
-            eye = np.eye(*w_shape, dtype=np.float32)
+            np_u = np.triu(np_u, k=1) # u without diagonal
+            l_mask = np.tril(np.ones(w_shape, dtype=np.float32), -1) #the mask of l without diagonal
+            eye = np.eye(*w_shape, dtype=np.float32) #identity
 
-            self.p = torch.Tensor(np_p.astype(np.float32))
-            self.sign_s = torch.Tensor(np_sign_s.astype(np.float32))
+            self.p = torch.Tensor(np_p.astype(np.float32)) # remain unchange in the whole training
+            self.sign_s = torch.Tensor(np_sign_s.astype(np.float32)) # unchange
             self.l = nn.Parameter(torch.Tensor(np_l.astype(np.float32)))
             self.log_s = nn.Parameter(torch.Tensor(np_log_s.astype(np.float32)))
             self.u = nn.Parameter(torch.Tensor(np_u.astype(np.float32)))
-            self.l_mask = torch.Tensor(l_mask)
-            self.eye = torch.Tensor(eye)
+            self.l_mask = torch.Tensor(l_mask) # unchange
+            self.eye = torch.Tensor(eye) # unchange
         self.w_shape = w_shape
         self.LU = LU_decomposed
 
     def get_weight(self, input, reverse):
+        '''
+        log-det = log|abs(|W|)| * pixels
+        '''
         w_shape = self.w_shape
         if not self.LU:
             pixels = thops.pixels(input)
@@ -228,7 +248,7 @@ class InvertibleConv1x1(nn.Module):
             else:
                 weight = torch.inverse(self.weight.double()).float()\
                               .view(w_shape[0], w_shape[1], 1, 1)
-            return weight, dlogdet
+            return weight, dlogdet # dlogdet not change when inverse
         else:
             self.p = self.p.to(input.device)
             self.sign_s = self.sign_s.to(input.device)
@@ -246,9 +266,6 @@ class InvertibleConv1x1(nn.Module):
             return w.view(w_shape[0], w_shape[1], 1, 1), dlogdet
 
     def forward(self, input, logdet=None, reverse=False):
-        """
-        log-det = log|abs(|W|)| * pixels
-        """
         weight, dlogdet = self.get_weight(input, reverse)
         if not reverse:
             z = F.conv2d(input, weight)
@@ -267,11 +284,9 @@ class GaussianDiag:
 
     @staticmethod
     def likelihood(mean, logs, x):
-        """
-        lnL = -1/2 * { ln|Var| + ((X - Mu)^T)(Var^-1)(X - Mu) + kln(2*PI) }
-              k = 1 (Independent)
-              Var = logs ** 2
-        """
+        '''
+        logs: log(deviation)
+        '''
         return -0.5 * (logs * 2. + ((x - mean) ** 2) / torch.exp(logs * 2.) + GaussianDiag.Log2PI)
 
     @staticmethod
@@ -298,6 +313,7 @@ class Split2d(nn.Module):
 
     def forward(self, input, logdet=0., reverse=False, eps_std=None):
         if not reverse:
+            # z2 is sample from an gaussian generated from z1
             z1, z2 = thops.split_feature(input, "split")
             mean, logs = self.split2d_prior(z1)
             logdet = GaussianDiag.logp(mean, logs, z2) + logdet
@@ -311,6 +327,7 @@ class Split2d(nn.Module):
 
 
 def squeeze2d(input, factor=2):
+    # reduce the image while increase the cahnnel
     assert factor >= 1 and isinstance(factor, int)
     if factor == 1:
         return input
